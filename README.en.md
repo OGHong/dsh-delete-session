@@ -35,7 +35,7 @@ so a second conversation in the same workspace is never disturbed.
 |---|---|
 | OS | macOS / Linux / Windows (pure Node, no platform APIs) |
 | Node | 22.6+ (what `engines` declares) |
-| DeepSeek Harness | desktop or web app (installed as a profile bundle) |
+| DeepSeek Harness | **0.2.0-rc.2 or newer (0.2.x)** — declared in `peerDependencies`; DSH refuses to load it on an incompatible version |
 | Dependencies | none at runtime; one peer, `@deepseek-ai/cordis` |
 
 ## Install

@@ -52,7 +52,8 @@
     "session"
   ],
   "engines": {
-    "node": ">=22.6"
+    "node": ">=22.6",
+    "dsh": ">=0.2.0-rc.2"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -61,7 +62,12 @@
     "verify": "npm run typecheck && npm run build && npm test"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.4"
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-api-workspace-controller": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-locale": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-workspace": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-home-paths": "^0.2.0-rc.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",

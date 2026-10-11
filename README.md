@@ -32,7 +32,7 @@
 |---|---|
 | 系统 | macOS / Linux / Windows 都行（纯 Node，不碰平台 API） |
 | Node | 22.6+（`package.json` 的 `engines` 写的就是它） |
-| DeepSeek Harness | 桌面版或 Web 版（作为 profile bundle 接入） |
+| DeepSeek Harness | **0.2.0-rc.2 及以上（0.2.x）** —— 在 `peerDependencies` 里声明，不兼容的版本 DSH 会在加载前拦下 |
 | 依赖 | 无运行时依赖；只有 `@deepseek-ai/cordis` 一个 peer |
 
 ## 安装
