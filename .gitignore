@@ -1,0 +1,10 @@
+# 构建产物：src/ 是唯一真源，lib/ 由 `npm run build` 生成
+lib/
+# 依赖与隔离开发目录（SOP 04：任何测试都不许写 ~/.dsh）
+node_modules/
+.dsh-dev/
+# 运行期垃圾
+*.log
+.DS_Store
+__pycache__/
+*.pyc

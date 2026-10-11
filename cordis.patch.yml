@@ -1,0 +1,20 @@
+# dsh-delete-session bundle patch: installs the plugin into a profile as one
+# insert. The row is addressed by id `delete-session`, so a profile's own
+# cordis.patch.yml can retarget it later:
+#
+#   - id: delete-session
+#     config:
+#       deleteLog: false
+#
+# The Host half activates as soon as `connection` is present; the browser half
+# is found through this row, because `dsh-client-modules` scans the Loader
+# entries for packages declaring `dsh.client`.
+
+- insert:
+    - id: delete-session
+      name: 'dsh-delete-session'
+      config:
+        # Remove each deleted session's log directory from the JSONL root.
+        # Leaving it on disk would keep the whole transcript after the
+        # conversation was reported as deleted.
+        deleteLog: true
