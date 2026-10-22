@@ -360,14 +360,69 @@ export interface DeleteOptions {
 	deleteLog?: boolean
 }
 
+/**
+ * Why a deletion refused, in a form a client can translate.
+ *
+ * The Host's `problems` lines are diagnostics — they exist for the report, the
+ * log, and anyone reading what happened. A client that wants to say the same
+ * thing in the operator's language needs a stable identifier, not an English
+ * sentence, so both travel: `code` to switch on, `reason` as the diagnostic and
+ * as the fallback for a client with no dictionary entry.
+ */
+export type RefusalCode =
+	/** The id is not a plain identifier, so it was never used to build a path. */
+	| 'bad-id'
+	/** A turn is running in the conversation, writing to the log being deleted. */
+	| 'turn-running'
+	/** Running subagent descendants depend on it; `count` says how many. */
+	| 'subagents-running'
+	/** No trace accounts for it: the Host cannot name this conversation. */
+	| 'unknown-session'
+	/** A service the deletion needs is missing or cannot do its part. */
+	| 'unavailable'
+	/** The caller's signal was already aborted. */
+	| 'cancelled'
+
+/** One refusal: the identifier a client translates, the count it may report, and the diagnostic. */
+export interface Refusal {
+	/** Stable identifier: what a client switches on. */
+	readonly code: RefusalCode
+	/** The count this refusal reports, when it reports one. */
+	readonly count?: number
+	/** The English sentence, kept as the diagnostic and as a client's fallback. */
+	readonly reason: string
+}
+
 /** What one deletion actually removed, step by step. */
 export interface DeleteReport {
 	/** The id as received, before it was validated. */
 	sessionId: unknown
-	/** Whether the archive entry could be cleared, which is the deletion itself. */
+	/** Whether the conversation is gone from every list, which is the deletion itself. */
 	deleted: boolean
-	/** Whether the session was archived at all. */
+	/**
+	 * Whether the conversation was archived when the deletion started.
+	 *
+	 * Not a precondition any more — a conversation can be deleted straight from
+	 * the sidebar — so this is a fact the report carries, and the only thing it
+	 * changes is what the archive residue line means.
+	 */
 	archived: boolean
+	/** Whether the running app still held the conversation in memory. */
+	resident: boolean
+	/**
+	 * The traces that accounted for the conversation, which is what allowed the
+	 * deletion to run at all. Empty after a refusal on an id the Host cannot
+	 * name — that is the refusal.
+	 */
+	known: string[]
+	/**
+	 * How the deletion was refused, or `null` when it ran.
+	 *
+	 * `problems` already says it in English; this is the same fact in a form the
+	 * browser can put into the operator's language, and it is what the route puts
+	 * on the wire so a client never has to pattern-match a diagnostic string.
+	 */
+	refusal: Refusal | null
 	/** Whether the backend still had the session stored. */
 	wasStored: boolean
 	/** How many workspace accounting slots were released. */

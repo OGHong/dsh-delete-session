@@ -369,6 +369,40 @@ section('the rewind store the deletion also has to clear')
 	equal('candidates are deduplicated', new Set(roots).size, roots.length)
 }
 
+section('deleting a conversation straight from the sidebar, unarchived')
+{
+	const root = await mkdtemp(join(tmpdir(), 'dsh-delete-session-'))
+	try {
+		const logDir = await seedLog(root, SESSION)
+		// The sidebar's own case: a row that was never archived, in a workspace,
+		// with a projection and a log — everything a normal conversation has.
+		const host = fakeHost({
+			workspaces: { 'ws-1': { sessionIds: [SESSION, OTHER], path: '/Users/someone/Documents/plugins' } },
+			archived: [],
+			projection: { [SESSION]: { asOfSeq: 4 } },
+			root,
+			stored: new Set([SESSION, OTHER])
+		})
+
+		const report = await deleteSession(host, SESSION)
+
+		check('the deletion succeeded without an archive step first', report.deleted, report.problems.join('; '))
+		check('it reported no problems', report.problems.length === 0, report.problems.join('; '))
+		check('it reports the conversation as not archived', report.archived === false)
+		check('it names the traces that accounted for it', report.known.length > 0, report.known.join('; '))
+		check('the backend was one of them', report.known.includes('the session backend'), report.known.join('; '))
+		check('a workspace record was another', report.known.includes('a workspace record'), report.known.join('; '))
+		equal('it released the workspace slot', report.workspacesReleased, 1)
+		equal('the sibling kept its slot', host.__tables.workspaces.get('ws-1').sessionIds, [OTHER])
+		check('the archive set was never touched', host.__registry.archivedSessionIds.length === 0)
+		check('the log is gone', !existsSync(logDir))
+		check('the projection is gone', !host.__tables.sessions.has(SESSION))
+		check('nothing was left behind', report.residue.length === 0, report.residue.join('; '))
+	} finally {
+		await rm(root, { recursive: true, force: true })
+	}
+}
+
 section('deleting an archived conversation')
 {
 	const root = await mkdtemp(join(tmpdir(), 'dsh-delete-session-'))
@@ -450,18 +484,58 @@ section('refusals')
 		check('a Host without a workspace registry refuses', !noRegistryReport.deleted)
 		check('the refusal names the missing service', noRegistryReport.problems[0]?.includes('workspaceRegistry'), noRegistryReport.problems.join('; '))
 
+		// A conversation that is *not* archived is deletable, straight from the
+		// sidebar. This is the whole point of the change: archiving is "do not show
+		// it to me", deletion is "it is gone", and requiring the first before the
+		// second made the common case (a row you are looking at) take two steps
+		// through a view you had to go find first.
+		await seedLog(root, SESSION)
 		const notArchived = fakeHost({ workspaces: {}, archived: [], root, stored: new Set([SESSION]) })
-		const refused = await deleteSession(notArchived, SESSION)
-		check('an unarchived conversation is refused', !refused.deleted)
-		check('the refusal explains why', refused.problems[0]?.includes('not archived'), refused.problems.join('; '))
-		check('the refusal removed nothing', existsSync(logDir))
+		const live = await deleteSession(notArchived, SESSION)
+		check('an unarchived conversation is deletable', live.deleted, live.problems.join('; '))
+		check('and it is clean', live.problems.length === 0, live.problems.join('; '))
+		check('it reports that it was not archived', live.archived === false)
+		check('it emptied the archive set it never was in', live.archiveCleared)
+		equal('no archive id was invented', notArchived.__registry.archivedSessionIds, [])
+		check('its log is gone', !existsSync(logDir))
 
+		// Deleting a conversation that is archived in another window, from a row
+		// the sidebar never listed as archived, must still clear the archive id:
+		// `unarchiveSession` runs unconditionally and the registry no-ops on an id
+		// it does not hold.
+		await seedLog(root, SESSION)
+		const archivedElsewhere = fakeHost({ workspaces: {}, archived: [SESSION], root, stored: new Set([SESSION]) })
+		const archivedReport = await deleteSession(archivedElsewhere, SESSION)
+		check('an archived conversation still deletes', archivedReport.deleted, archivedReport.problems.join('; '))
+		check('and the report says it was archived', archivedReport.archived)
+		equal('its archive id is cleared', archivedElsewhere.__registry.archivedSessionIds, [])
+
+		// The allowlist that replaced the archive set: the Host has to be able to
+		// name the conversation. An id nothing accounts for is refused, so a body
+		// from the browser can never report `deleted: true` about a row the Host
+		// never had.
+		const unknown = fakeHost({ workspaces: {}, archived: [], root, stored: new Set() })
+		const unknownReport = await deleteSession(unknown, 'session-00000000-0000-4000-8000-0000000009ff')
+		check('an id the Host cannot name is refused', !unknownReport.deleted)
+		check('the refusal says the Host cannot name it', unknownReport.problems[0]?.includes('cannot name this conversation'), unknownReport.problems.join('; '))
+		equal('and no trace accounted for it', unknownReport.known, [])
+
+		// Re-seeded: the cases above are *allowed* to proceed, and they really did
+		// delete this conversation's log.
+		await seedLog(root, SESSION)
 		const running = fakeHost({ workspaces: {}, archived: [SESSION], root, live: { agents: [SESSION] }, stored: new Set([SESSION]) })
 		const runningReport = await deleteSession(running, SESSION)
 		check('a conversation with a running turn is refused', !runningReport.deleted)
 		check('the running refusal explains why', runningReport.problems[0]?.includes('a turn is running'), runningReport.problems.join('; '))
 		check('a running refusal leaves the archive set alone', running.__registry.archivedSessionIds.includes(SESSION))
 		check('a running refusal leaves the log', existsSync(logDir))
+
+		// A running turn is refused whether or not the row is archived, which is
+		// the refusal that carries the weight now that archiving is not a gate.
+		const runningUnarchived = fakeHost({ workspaces: {}, archived: [], root, live: { agents: [SESSION] }, stored: new Set([SESSION]) })
+		const runningUnarchivedReport = await deleteSession(runningUnarchived, SESSION)
+		check('a running conversation is refused without being archived too', !runningUnarchivedReport.deleted)
+		check('and says why', runningUnarchivedReport.problems[0]?.includes('a turn is running'), runningUnarchivedReport.problems.join('; '))
 
 		const descendant = fakeHost({
 			workspaces: {},
@@ -1080,6 +1154,44 @@ section('the browser half is a loadable, self-contained bundle')
 	check('the menu row sorts after the shipped archive row (400)', registered.find((entry) => entry.id.endsWith('.delete')) !== undefined)
 	check('every registration carries a component', registered.every((entry) => typeof entry.component === 'function'))
 
+	/* ---- the menu row is not archived-only ------------------------------- */
+
+	// Deletion used to appear only on an archived row, which put the destructive
+	// action behind "archive it first, then find the archived page". The row is
+	// unconditional now — the Host refuses a conversation with work in flight, and
+	// that refusal is what protects it. These checks pin the shape: a row renders
+	// while the conversation is NOT archived, and its inject face no longer even
+	// asks whether it is.
+	const menuEntry = registered.find((entry) => entry.id === 'dsh-delete-session.delete')
+	const menuInjected = menuEntry.inject()
+	check('the menu row injects no archive predicate at all', !('useArchived' in menuInjected), Object.keys(menuInjected).join(','))
+	// The confirmation seat is one shared store, so reading the pending request
+	// through its own inject face is what the overlay does. Settle it afterwards so
+	// the checks below start from "nothing pending".
+	const pendingNow = () => registered.find((entry) => entry.id === 'dsh-delete-session.confirm').inject().usePending((value) => value)
+	pushArchive([])
+	let menuClosed = 0
+	const renderMenuItem = () =>
+		menuEntry.component({
+			sessionId: SESSION,
+			useMenuOpenState: () => [true, () => {
+				menuClosed += 1
+			}],
+			...menuInjected
+		})
+	const unarchivedRow = renderMenuItem()
+	check('it renders on a conversation that is not archived', unarchivedRow !== null && unarchivedRow !== undefined)
+	equal('and it is the delete row', unarchivedRow?.props?.children, 'dsh-delete-session.menu')
+	check('it is a danger row', unarchivedRow?.props?.danger === true)
+	check('it draws a separator before itself', unarchivedRow?.props?.separatorBefore === true)
+	unarchivedRow?.props?.onSelect?.()
+	equal('selecting it closes the menu', menuClosed, 1)
+	equal('and raises the confirmation for that conversation', pendingNow(), { kind: 'one', sessionId: SESSION })
+	registered.find((entry) => entry.id === 'dsh-delete-session.confirm').inject().settleDelete()
+	// Also while archived, so the archived view keeps the row it had.
+	pushArchive([SESSION])
+	check('it still renders on an archived conversation', renderMenuItem()?.props?.children === 'dsh-delete-session.menu')
+
 	/* ---- the section id is what carries the nav glyph -------------------- */
 
 	// `settings.section` projects only id/order/label, and the shell picks the nav
@@ -1214,6 +1326,85 @@ section('the browser half is a loadable, self-contained bundle')
 	const noticeEntry = registered.find((entry) => entry.id === 'dsh-delete-session.notice')
 	const toast = noticeEntry.component(noticeEntry.inject())
 	check('the toast is keyed per notice through the jsx runtime, not a prop', toast?.key === String(residueNotice.id) && toast?.props?.key === undefined)
+
+	/* ---- a refusal is explained in the operator's language --------------- */
+
+	// Now that the row is on every conversation, the commonest answer to a
+	// deletion is a refusal — a turn is running. The Host answers with a stable
+	// code plus its own English sentence; printing that sentence in a Chinese UI
+	// is the failure this section pins. The fake locale resolves a key to
+	// `<namespace>.<key>`, so a translated notice carries the copy KEY, and a
+	// passed-through diagnostic carries the Host's English text.
+	singleAnswer = {
+		ok: false,
+		error: {
+			code: 'delete-session/refused',
+			message: 'refused: a turn is running in this conversation',
+			details: { refusal: { code: 'turn-running', reason: 'a turn is running in this conversation' } }
+		}
+	}
+	await confirmInjected.confirmDelete(SESSION)
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	let refusalNotice = noticeEntry.inject().useNotice((value) => value)
+	equal('a running-turn refusal is reported as a failure', refusalNotice?.tone, 'failed')
+	// The copy must attribute it, and must not leak the Host's English sentence.
+	check(
+		'the turn refusal is translated rather than echoed',
+		String(refusalNotice?.detail).includes('dsh-delete-session.refusedTurn') && !String(refusalNotice?.detail).includes('a turn is running in this conversation'),
+		refusalNotice?.detail
+	)
+	check('the notice copy no longer names archiving', !String(refusalNotice?.detail).includes('not archived'), refusalNotice?.detail)
+
+	// The count is interpolated, so "4 subagents" is not "1 subagent".
+	singleAnswer = {
+		ok: false,
+		error: {
+			code: 'delete-session/refused',
+			message: 'refused: 4 running subagents depend on this conversation',
+			details: { refusal: { code: 'subagents-running', count: 4, reason: '4 running subagents depend on this conversation' } }
+		}
+	}
+	await confirmInjected.confirmDelete(SESSION)
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	refusalNotice = noticeEntry.inject().useNotice((value) => value)
+	check(
+		'the subagent refusal carries its count into the copy',
+		String(refusalNotice?.detail).includes('dsh-delete-session.refusedSubagents'),
+		refusalNotice?.detail
+	)
+	// The dictionary is what actually interpolates `{n}`, so the assertion above
+	// alone could pass with the placeholder left in. Read the shipped Chinese copy.
+	const zh = fakeLocale.registered.find(([, id]) => id === 'zh')?.[2]
+	check('the Chinese dictionary ships every refusal sentence', [
+		'refusedTurn',
+		'refusedSubagents',
+		'refusedUnknown',
+		'refusedBadId',
+		'refusedUnavailable',
+		'refusedCancelled'
+	].every((key) => typeof zh?.[key] === 'string' && zh[key].length > 0), JSON.stringify(Object.keys(zh ?? {}).filter((key) => key.startsWith('refused'))))
+	check('the subagent copy interpolates the count', String(zh?.refusedSubagents).includes('{n}'), zh?.refusedSubagents)
+
+	// An unknown code from a newer Host must still explain itself rather than print
+	// a copy key that resolves to itself.
+	singleAnswer = {
+		ok: false,
+		error: { code: 'delete-session/refused', message: 'refused: something new', details: { refusal: { code: 'a-newer-refusal', reason: 'something new and untranslatable' } } }
+	}
+	await confirmInjected.confirmDelete(SESSION)
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	refusalNotice = noticeEntry.inject().useNotice((value) => value)
+	check(
+		'a refusal code this build does not know falls back to the Host sentence',
+		String(refusalNotice?.detail).includes('something new and untranslatable'),
+		refusalNotice?.detail
+	)
+	// And a Host that sends no reason at all still produces a sentence.
+	singleAnswer = { ok: false, error: { code: 'delete-session/refused', message: 'refused: bare' } }
+	await confirmInjected.confirmDelete(SESSION)
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	refusalNotice = noticeEntry.inject().useNotice((value) => value)
+	check('a refusal with no reason code falls back to the Host message', String(refusalNotice?.detail).includes('refused: bare'), refusalNotice?.detail)
 
 	/* ---- the batch surface: search, restore, multi-select --------------- */
 
@@ -1794,11 +1985,33 @@ section('the archived routes answer the contract the browser half reads')
 			['archiveCleared', 'logRemoved', 'projectionDropped', 'rewindRemoved', 'workspacesReleased']
 		)
 		equal('a clean single deletion reports no residue', single.body?.value?.residue, [])
-		const refusedSingle = await request(routes, { method: 'POST', url: '/_delete-session/delete', body: JSON.stringify({ sessionId: THIRD }) })
+		// A refusal still travels as `ok: false` in a 200 body, so the browser can
+		// show the reason instead of a bare HTTP status. The id has to be one no
+		// trace accounts for: re-deleting THIRD is not a refusal, because this fake
+		// backend's durable index keeps naming it (`stored` is a fixed set here)
+		// even after its log is gone — and a conversation the Host can still name
+		// is one it may still try to clear.
+		const refusedSingle = await request(routes, {
+			method: 'POST',
+			url: '/_delete-session/delete',
+			body: JSON.stringify({ sessionId: 'session-00000000-0000-4000-8000-0000000000ff' })
+		})
 		equal(
 			'a refused single deletion still answers with its own code',
 			[refusedSingle.status, refusedSingle.body?.ok, refusedSingle.body?.error?.code],
 			[200, false, 'delete-session/refused']
+		)
+		// The browser translates the refusal, so the reason has to arrive as a code
+		// rather than as an English sentence it would have to pattern-match.
+		equal(
+			'a refusal carries the translatable reason code',
+			refusedSingle.body?.error?.details?.refusal?.code,
+			'unknown-session'
+		)
+		check(
+			'and keeps the English sentence as the diagnostic',
+			typeof refusedSingle.body?.error?.details?.refusal?.reason === 'string' && refusedSingle.body.error.details.refusal.reason.includes('cannot name'),
+			JSON.stringify(refusedSingle.body?.error?.details?.refusal)
 		)
 
 		const batch = await request(routes, { method: 'POST', url: '/_delete-session/delete-all', body: '{}' })

@@ -2,17 +2,21 @@
 
 # dsh-delete-session
 
-**Actually delete an archived DeepSeek Harness conversation from its sidebar menu** — transcript,
-cached projections, workspace accounting and rewind snapshots included.
+**Actually delete a DeepSeek Harness conversation from its sidebar menu** — archived or not —
+transcript, cached projections, workspace accounting and rewind snapshots included.
 
 ## What it adds
 
-- **A "Delete conversation" row in a session's `...` menu**: it only shows up while that session is
-  archived, sits after the shipped "Unarchive" row, and asks for an explicit acknowledgment before
-  anything is removed;
+- **A "Delete conversation" row in every session's `...` menu** — archived or not, no archive step
+  required first. It sits after the shipped "Archive"/"Unarchive" row, and asks for an explicit
+  acknowledgement before anything is removed;
 - **Settings → Archived conversations**: a page listing every archived session with a search field,
   whose right end holds the irreversible action (outlined, in the theme's error colour — never a
   plain button).
+
+Deletion is no longer hidden behind archiving: archiving is "do not show it to me", deletion is
+"it is gone", and they are different decisions. The menu offers deletion directly because the row
+you are actually looking at is the one you most often want gone.
 
 Confirming removes all of these traces, and reports any residue by name instead of calling it
 "some files":
@@ -67,8 +71,11 @@ Override by id in your profile's `cordis.patch.yml`:
 
 ## Safety
 
-- the row **only appears for archived sessions**: archiving means "I do not want to see it in the
-  sidebar", deleting is a different decision, and the two stay separate;
+- the row **appears on every session**. What guards it now is the Host: a conversation with a
+  running turn, or with running subagent descendants, is refused with the reason stated; so is an id
+  the Host cannot name at all — not in the archive set, the live registry, the session backend, any
+  workspace record, or on disk as a log directory — so the route never answers `deleted: true` about
+  a row that does not exist;
 - deleting asks for an explicit acknowledgment, it is not a single click;
 - every step is guarded (only the one directory under `<dshHome>` is touched), and the running
   session is **released before** anything durable is removed — the other order writes the
@@ -82,7 +89,7 @@ Why the order is what it is, the fourteen silent failures it closes, the layout 
 checks all live in **[docs/DESIGN.md](docs/DESIGN.md)** (Chinese).
 
 ```bash
-npm run verify     # typecheck + build + 292 self-test assertions
+npm run verify     # typecheck + build + 323 self-test assertions
 ```
 
 ## License

@@ -63,6 +63,7 @@ import type {
 	DeleteReport,
 	HostServices,
 	ListArchivedOptions,
+	Refusal,
 	ServiceContext,
 	StorageTable,
 	WorkspaceEntity,
@@ -183,9 +184,9 @@ interface Probe<T> {
  * "cannot determine" into a refusal that nothing can clear.
  * @param ctx - Host context.
  * @param sessionId - Session being considered.
- * @returns A human-readable reason to refuse, or undefined when deletion may proceed.
+ * @returns The refusal, or undefined when deletion may proceed.
  */
-export async function liveBlocker(ctx: ServiceContext, sessionId: string): Promise<string | undefined> {
+export async function liveBlocker(ctx: ServiceContext, sessionId: string): Promise<Refusal | undefined> {
 	const probe = async <T>(run: () => T | Promise<T>): Promise<Probe<T>> => {
 		try {
 			return { ok: true, value: await run() }
@@ -195,14 +196,14 @@ export async function liveBlocker(ctx: ServiceContext, sessionId: string): Promi
 	}
 
 	const agent = await probe(() => ctx.get('agents')?.get(sessionId))
-	if (agent.ok && agent.value?.status === 'running') return 'a turn is running in this conversation'
+	if (agent.ok && agent.value?.status === 'running') return { code: 'turn-running', reason: 'a turn is running in this conversation' }
 
 	const descendants = await probe(() => runningDescendants(ctx, sessionId))
 	if (descendants.ok && (descendants.value?.length ?? 0) > 0) {
 		// The guard above is what proves a value arrived, `noUncheckedIndexedAccess`
 		// does not: `value` is typed as possibly absent, as it is for every probe.
 		const count = descendants.value!.length
-		return `${String(count)} running subagent${count === 1 ? '' : 's'} depend on this conversation`
+		return { code: 'subagents-running', count, reason: `${String(count)} running subagent${count === 1 ? '' : 's'} depend on this conversation` }
 	}
 	return undefined
 }
@@ -393,8 +394,14 @@ export function accountingWorkspaces(ctx: ServiceContext, sessionId: string): Wo
  * unaccounted but still archived — invisible either way, and a re-run finishes
  * the job. The reverse order would leave an unarchived session with an intact
  * log, which reappears in the sidebar as a normal conversation.
+ *
+ * `unarchiveSession` is called unconditionally, archived or not: the registry's
+ * own implementation returns without writing for an id that is not in the set,
+ * so this stays one code path and a session deleted straight from the sidebar
+ * leaves no stray id behind if it was archived in another window a moment
+ * earlier.
  * @param ctx - Host context.
- * @param sessionId - The archived session being deleted.
+ * @param sessionId - The session being deleted.
  * @returns How many workspace slots were released.
  */
 export async function unregisterSession(ctx: ServiceContext, sessionId: string): Promise<number> {
@@ -710,12 +717,72 @@ export async function dropProjection(ctx: ServiceContext, sessionId: string, opt
 }
 
 /**
- * Delete one archived session completely.
+ * Whether the Host can account for this conversation at all.
  *
- * The archive set is the authority on whether a session is deletable: a session
- * that is not archived is never touched, so this can only ever act on rows the
- * archived view is showing. An archive entry whose log is already gone is not an
- * error — clearing that residue is exactly what this is for.
+ * This is the guard that replaced "the archive set is the allowlist". Deletion
+ * is reachable from the sidebar now, where most rows are *not* archived, so the
+ * allowlist has to be a statement about the conversation rather than about one
+ * list that happened to contain it: the Host must be able to name it — from the
+ * archive set, from its live registry, from the persistence backend, from a
+ * workspace's accounting slots, or from a log directory on disk. An id none of
+ * those know is not a conversation this Host has, and removing "nothing" for it
+ * would answer `deleted: true` about a row that never existed.
+ *
+ * Every probe fails open in the direction that keeps a real conversation
+ * deletable: a probe that throws is no answer, and another probe may still
+ * account for the session. Only the absence of *all* answers refuses.
+ * @param ctx - Host context.
+ * @param sessionId - The session being considered.
+ * @param options - `signal` cancels discovery, `archived` and `resident` are
+ *   facts the caller already read (so they are not re-read here).
+ * @returns The traces that account for it; empty means the Host does not know it.
+ */
+export async function accountingTraces(
+	ctx: ServiceContext,
+	sessionId: string,
+	options: { signal?: AbortSignal; archived?: boolean; resident?: boolean } = {}
+): Promise<string[]> {
+	const traces: string[] = []
+	if (options.archived === true) traces.push('the archive set')
+	if (options.resident === true) traces.push('the live registry')
+
+	try {
+		if ((await ctx.get('sessionPersistence')?.stat(sessionId, { signal: options.signal })) !== undefined) traces.push('the session backend')
+	} catch {
+		/* A backend that cannot answer is not evidence that the session is gone. */
+	}
+
+	try {
+		if (accountingWorkspaces(ctx, sessionId).length > 0) traces.push('a workspace record')
+	} catch {
+		/* No registry to read: the other probes still decide. */
+	}
+
+	try {
+		const root = sessionRoot(ctx)
+		if (root !== undefined && (await locateLogDir(root, sessionId)) !== undefined) traces.push('a log directory')
+	} catch {
+		/* An unreadable root is not evidence of a conversation either way. */
+	}
+
+	return traces
+}
+
+/**
+ * Delete one conversation completely.
+ *
+ * A conversation does not have to be archived to be deleted. Archiving is "I do
+ * not want to see it in the sidebar", deletion is "it is gone", and requiring
+ * the first before the second made the common case — a conversation you are
+ * looking at right now — take two steps through a view you have to go find
+ * first. The row's own menu offers deletion directly, and the archive view
+ * offers it too; both reach this function, which is why the guard is
+ * {@link accountingTraces} rather than the archive set.
+ *
+ * What is *not* relaxed: a conversation with work in flight is still refused
+ * (see {@link liveBlocker}), and the id is still validated before it is used to
+ * build a path. An entry whose log is already gone is not an error — clearing
+ * that residue is exactly what this is for.
  * @param ctx - Host context.
  * @param sessionId - The session to delete.
  * @param options - `signal` cancels discovery, `deleteLog` skips the last step.
@@ -727,6 +794,8 @@ export async function deleteSession(ctx: ServiceContext, sessionId: unknown, opt
 		sessionId,
 		deleted: false,
 		archived: false,
+		resident: false,
+		known: [],
 		wasStored: false,
 		workspacesReleased: 0,
 		archiveCleared: false,
@@ -734,6 +803,7 @@ export async function deleteSession(ctx: ServiceContext, sessionId: unknown, opt
 		rewindRemoved: false,
 		projectionDropped: false,
 		evicted: false,
+		refusal: null,
 		problems: [],
 		notes: [],
 		residue: []
@@ -741,6 +811,7 @@ export async function deleteSession(ctx: ServiceContext, sessionId: unknown, opt
 
 	if (!isSessionId(sessionId)) {
 		report.problems.push('refused: the session id is not a plain identifier')
+		report.refusal = { code: 'bad-id', reason: 'the session id is not a plain identifier' }
 		return report
 	}
 	let registry: WorkspaceRegistry
@@ -748,25 +819,25 @@ export async function deleteSession(ctx: ServiceContext, sessionId: unknown, opt
 		registry = requireService(ctx, 'workspaceRegistry', 'deleting a conversation')
 	} catch (error) {
 		report.problems.push(`refused: ${message(error)}`)
+		report.refusal = { code: 'unavailable', reason: message(error) }
 		return report
 	}
 	if (typeof registry.unarchiveSession !== 'function') {
 		report.problems.push("refused: this Host's workspace registry cannot edit the archive set, so nothing can be removed")
+		report.refusal = { code: 'unavailable', reason: "this Host's workspace registry cannot edit the archive set" }
 		return report
 	}
-	if (!registry.archivedSessionIds.includes(sessionId)) {
-		report.problems.push('refused: this conversation is not archived, and only archived conversations can be deleted here')
-		return report
-	}
-	report.archived = true
+	report.archived = registry.archivedSessionIds.includes(sessionId)
 
 	const blocker = await liveBlocker(ctx, sessionId)
 	if (blocker !== undefined) {
-		report.problems.push(`refused: ${blocker}`)
+		report.problems.push(`refused: ${blocker.reason}`)
+		report.refusal = blocker
 		return report
 	}
 	if (signal?.aborted) {
 		report.problems.push('cancelled before anything was removed')
+		report.refusal = { code: 'cancelled', reason: 'cancelled before anything was removed' }
 		return report
 	}
 
@@ -776,6 +847,20 @@ export async function deleteSession(ctx: ServiceContext, sessionId: unknown, opt
 	// Allowed, but worth saying: the app's own read models can keep a row for a
 	// conversation whose files are gone until they next refresh.
 	const resident = isResident(ctx, sessionId)
+	report.resident = resident
+
+	// The allowlist, and the only one: the Host has to be able to name this
+	// conversation. It is read *after* the liveness refusal so that a running
+	// turn is reported as what it is, and *before* anything is removed so that an
+	// id the Host never had cannot answer `deleted: true`.
+	const traces = await accountingTraces(ctx, sessionId, { signal, archived: report.archived, resident })
+	if (traces.length === 0) {
+		const reason = 'this Host cannot name this conversation — it is not in the archive set, the live registry, the session backend, a workspace record, or a log directory'
+		report.problems.push(`refused: ${reason}`)
+		report.refusal = { code: 'unknown-session', reason }
+		return report
+	}
+	report.known = traces
 
 	try {
 		report.workspacesReleased = await unregisterSession(ctx, sessionId)

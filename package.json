@@ -1,6 +1,6 @@
 {
   "name": "dsh-delete-session",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Delete an archived DeepSeek Harness conversation from its sidebar menu, including its transcript on disk and cached projections",
   "license": "MIT",
   "author": "OGHong",

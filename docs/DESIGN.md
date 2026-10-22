@@ -7,15 +7,29 @@
 ---
 # dsh-delete-session
 
-Delete an archived DeepSeek Harness conversation from its own sidebar menu —
-transcript, cached projections, workspace accounting, and all.
+Delete a DeepSeek Harness conversation from its own sidebar menu — archived or
+not — transcript, cached projections, workspace accounting, and all.
 
 ## What it adds
 
 One row in a Session's `...` menu: **删除会话 / Delete conversation**. It appears
-only while that row is archived, sits after the shipped **取消归档**
-(Unarchive) row, and asks for an explicit acknowledgment before anything is
-removed.
+on **every** conversation, sits after the shipped **归档 / 取消归档**
+(Archive/Unarchive) row, and asks for an explicit acknowledgment before anything
+is removed.
+
+It used to appear only while that row was archived, which made an irreversible
+action harder to reach than a reversible one: delete required "archive it, then
+go to the archived page, then delete". The justification was that archiving
+proved intent — but the sidebar row you are looking at *is* the intent, and the
+real protection was never the archive gate: it is the Host's refusal on a
+conversation with work in flight, which has not moved.
+
+The allowlist that replaced the archive gate is `accountingTraces()`: the Host
+must be able to name the conversation — in the archive set, in the live
+registry, in the session backend, in a workspace's accounting slots, or on disk
+as a log directory. An id none of those answer for is refused, so the route can
+never report `deleted: true` about a row that never existed. Every probe fails
+open, and only the absence of *all* of them refuses.
 
 Confirming deletes the conversation for real:
 
@@ -174,8 +188,11 @@ reaches every step) and reports what it already did.
 
 Deletion is irreversible, so the plugin refuses before it removes anything:
 
-- a conversation that is **not archived** is never touched — this action can
-  only ever act on rows the archived view is showing;
+- a conversation the Host **cannot name** is refused: not in the archive set, not
+  in the live registry, not in the session backend, in no workspace record, and
+  with no log directory on disk. Archiving is *not* a precondition (the sidebar
+  row is the normal entry point), so this is what keeps a browser body from
+  claiming a deletion that removed nothing;
 - a conversation with a **running turn** — an agent mid-step, writing to the
   very log being deleted — or one with **running subagent descendants** is refused,
   whatever the caller asks. A conversation the app merely *holds in memory* is
@@ -194,6 +211,10 @@ unaccounted and unarchived — invisible everywhere — and the leftover bytes a
 inert data a later attempt clears. Nothing half-deleted is ever visible, and
 nothing half-deleted is called clean either: the closing audit re-reads all five
 traces and reports what it found.
+
+A refusal reports as `refused` when nothing was touched, and as `partial` when a
+removal step had already run. That discriminator used to be "was it archived",
+which stopped meaning anything the moment deletion stopped requiring it.
 
 ## Language
 
@@ -450,7 +471,7 @@ perfectly healthy.
 | [`src/client.ts`](src/client.ts) | Browser half: the menu row, the confirmation, and the outcome notice. |
 | [`src/types.d.ts`](src/types.d.ts) | The host boundary as local structural types. Type-only: emits nothing. |
 | `lib/*.js` | Build output of `npm run build`, and what the profile actually loads. |
-| [`selftest.mjs`](selftest.mjs) | 290 checks over the deletion, the archived list and batch, the routes, and the browser half — rendered and driven, not just parsed. |
+| [`selftest.mjs`](selftest.mjs) | 323 checks over the deletion, the archived list and batch, the routes, and the browser half — rendered and driven, not just parsed. |
 
 ## Development
 
@@ -483,7 +504,7 @@ Two rules this package follows, both from the DSH plugin contract:
 npm run verify
 ```
 
-Besides the 290 checks, two levels beyond the unit suite:
+Besides the 323 checks, two levels beyond the unit suite:
 
 - **Host, over HTTP.** A seeded archived conversation lost its log directory, its
   archive-set id and its accounting slot while a sibling conversation was

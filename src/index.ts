@@ -198,17 +198,32 @@ function reportBody(report: DeleteReport) {
 			}
 		}
 	}
+	// `partial` used to mean "it was archived, so the deletion had already started
+	// and could not finish". Archiving is no longer the gate, so the
+	// discriminator is the fact that actually separates the two cases: did any
+	// removal step run? A refusal that touched nothing is `refused`; a deletion
+	// that removed something and then stopped is `partial`.
+	const touched = removed.workspacesReleased > 0 || removed.archiveCleared || removed.logRemoved || removed.rewindRemoved || removed.projectionDropped
 	return {
 		ok: false,
 		error: {
-			code: report.archived ? CODES.partial : CODES.refused,
+			code: touched ? CODES.partial : CODES.refused,
 			message: report.problems[0] ?? 'the conversation could not be deleted',
 			details: {
 				sessionId: report.sessionId,
 				problems: report.problems,
 				notes: report.notes,
 				residue: report.residue,
-				removed
+				removed,
+				// Facts that explain a refusal without the operator having to guess:
+				// whether the conversation was archived (no longer a precondition, but
+				// it changes what the refusal means), whether the app held it in
+				// memory, which traces accounted for it in the first place, and — the
+				// one the browser actually renders — a translatable reason code.
+				archived: report.archived,
+				resident: report.resident,
+				known: report.known,
+				refusal: report.refusal
 			}
 		}
 	}

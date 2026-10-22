@@ -1,10 +1,17 @@
 /**
  * `dsh-delete-session` — the browser half.
  *
- * One row in a Session's "..." menu: **delete this conversation**, shown only on
- * an archived row, gated behind an acknowledgment, and carried out by the Host
- * over Connection's generic RPC channel. The Host owns the deletion; this half
- * owns the menu entry, the confirmation, and the follow-up refresh.
+ * One row in a Session's "..." menu: **delete this conversation**, on every
+ * conversation the sidebar shows — archived or not — gated behind an
+ * acknowledgment, and carried out by the Host over Connection's generic RPC
+ * channel. The Host owns the deletion; this half owns the menu entry, the
+ * confirmation, and the follow-up refresh.
+ *
+ * Deletion used to be reachable only from an archived row, which meant two
+ * steps through a view the operator had to go find. Archiving is "do not show
+ * it to me"; deletion is "it is gone". The menu row is therefore unconditional:
+ * a running conversation is refused by the Host (and reported as such), and the
+ * settings page keeps its own archived-only controls.
  *
  * Three rules this file follows, all of them learned the hard way in
  * `plugins/dsh-purge-archived/INCIDENT.md`:
@@ -389,6 +396,20 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * One refusal, as the Host reports it.
+		 *
+		 * `code` is what this half switches on; `reason` is the Host's English
+		 * sentence and is used only when the active locale has no entry for that
+		 * code. `count` fills a sentence that reports how many, which is
+		 * `subagents-running` and nothing else today.
+		 */
+		interface HostRefusal {
+			readonly code?: string
+			readonly count?: number
+			readonly reason?: string
+		}
+
+		/**
 		 * One answer from the Host route.
 		 *
 		 * Every success field is optional and read through guards: `JSON.parse` is
@@ -422,14 +443,21 @@ window.__ModuleLoader__.load({
 					}
 					readonly error?: undefined
 			  }
-			| { readonly ok: false; readonly value?: undefined; readonly error?: { readonly message?: string } }
+			| {
+					readonly ok: false
+					readonly value?: undefined
+					readonly error?: {
+						readonly message?: string
+						/** The translatable refusal, when the Host refused rather than failed. */
+						readonly details?: { readonly refusal?: HostRefusal | null }
+					}
+			  }
 
 		/** What this half injects into the row. */
 		interface MenuInjected {
 			readonly requestDelete: (sessionId: string) => void
 			readonly t: Translate
 			readonly useLocale: () => LocaleSnapshot
-			readonly useArchived: SelectorHook<ReadonlySet<string>>
 		}
 
 		/** The row's props: the owner's own share plus the inject face above. */
@@ -540,7 +568,13 @@ window.__ModuleLoader__.load({
 			'bulkResidue',
 			'bulkResidueTail',
 			'today',
-			'yesterday'
+			'yesterday',
+			'refusedTurn',
+			'refusedSubagents',
+			'refusedUnknown',
+			'refusedBadId',
+			'refusedUnavailable',
+			'refusedCancelled'
 		] as const
 
 		/** One copy key, taken from the list above so the two cannot drift. */
@@ -603,7 +637,13 @@ window.__ModuleLoader__.load({
 				bulkResidue: 'Deleted {n} conversation(s), but {residue} kept files on disk.',
 				bulkResidueTail: '{residue} also kept files on disk.',
 				today: 'Today',
-				yesterday: 'Yesterday'
+				yesterday: 'Yesterday',
+				refusedTurn: 'A turn is running in this conversation. Stop it first, then delete.',
+				refusedSubagents: 'Still running: {n} subagent(s). Stop them first, then delete.',
+				refusedUnknown: 'This Host cannot find the conversation: it is not in the archive set, the live registry, the session backend, any workspace record, and no log directory holds it.',
+				refusedBadId: 'That session id is not a valid identifier, so nothing was removed.',
+				refusedUnavailable: 'This Host is missing a service the deletion needs, so nothing was removed.',
+				refusedCancelled: 'The request was cancelled and nothing was removed.'
 			},
 			zh: {
 				menu: '删除会话',
@@ -652,7 +692,13 @@ window.__ModuleLoader__.load({
 				bulkResidue: '已删除 {n} 个会话,但有 {residue} 个残留文件未能清理。',
 				bulkResidueTail: '另有 {residue} 个残留文件未能清理。',
 				today: '今天',
-				yesterday: '昨天'
+				yesterday: '昨天',
+				refusedTurn: '这个会话正在跑回合,先停掉再删除。',
+				refusedSubagents: '还有 {n} 个子代理在跑,先停掉再删除。',
+				refusedUnknown: '宿主找不到这个会话:它不在归档集合、运行注册表、会话后端、工作区记录里,磁盘上也没有它的日志目录。',
+				refusedBadId: '会话 id 不是合法标识符,已拒绝。',
+				refusedUnavailable: '宿主缺少删除所需的服务,已拒绝。',
+				refusedCancelled: '请求已取消,什么都没删。'
 			}
 		}
 
@@ -690,53 +736,43 @@ window.__ModuleLoader__.load({
 			return table
 		}
 
-		/* ------------------------------------------------------------------ */
-		/* observable helpers                                                  */
-		/* ------------------------------------------------------------------ */
-
 		/**
-		 * Project one observable into another, recomputing only when the source
-		 * snapshot changes identity.
-		 * @param source - The observable to project.
-		 * @param project - Pure projection of one source snapshot.
-		 * @returns The projected observable, subscribing through the source.
-		 */
-		function derive<S, T>(source: Observable<S>, project: (snapshot: S) => T): Observable<T> {
-			let seen: S | undefined
-			let value: T | undefined
-			return {
-				getSnapshot: () => {
-					const snapshot = source.getSnapshot()
-					if (value === undefined || snapshot !== seen) {
-						seen = snapshot
-						value = project(snapshot)
-					}
-					// `project` seeded `value` on the first call, and every later call
-					// either returns it or reseeds it; the `undefined` check above cannot
-					// tell the checker that, so the invariant is asserted here.
-					return value as T
-				},
-				subscribe: (listener) => source.subscribe(listener)
-			}
-		}
-
-		/**
-		 * Build the `useArchived` selector hook the row subscribes through.
+		 * Turn the Host's refusal into a sentence in the operator's language.
 		 *
-		 * It mirrors the shape the shipped archive row uses — a `useSelector` over a
-		 * Set — because React calls the hook it receives directly. The row's own
-		 * `sessionId` is *not* a parameter here: it arrives as an owner prop and the
-		 * row passes its own selector, which is the only place that value is needed.
-		 * @param archivedSet - Observable archive set.
-		 * @returns A selector hook answering whether a row is archived.
+		 * The Host answers with a stable `code` plus its own English `reason`. This
+		 * maps the codes this build knows onto its dictionaries, and falls back to
+		 * the Host's sentence for anything else — a newer Host with a new refusal
+		 * must still be able to explain itself, rather than resolve a key to itself
+		 * and print `dsh-delete-session.refusedSomething`.
+		 * @param t - The namespace's translate function.
+		 * @param refusal - The Host's refusal, as far as it is readable.
+		 * @param fallback - The Host's top-level message, used when no reason came.
+		 * @returns One sentence to show the operator.
 		 */
-		function bindArchivedHook(archivedSet: Observable<ReadonlySet<string>>): SelectorHook<ReadonlySet<string>> {
-			return <Selected>(selector: (archived: ReadonlySet<string>) => Selected): Selected =>
-				react.useSyncExternalStore(
-					archivedSet.subscribe,
-					() => selector(archivedSet.getSnapshot()),
-					() => selector(archivedSet.getSnapshot())
-				)
+		function refusalText(t: Translate, refusal: HostRefusal | null | undefined, fallback: string): string {
+			const reason = typeof refusal?.reason === 'string' && refusal.reason.length > 0 ? refusal.reason : fallback
+			switch (refusal?.code) {
+				case 'turn-running':
+					return t('refusedTurn')
+				case 'subagents-running': {
+					const count = typeof refusal.count === 'number' && Number.isFinite(refusal.count) ? refusal.count : 0
+					// An unknown count is not a reason to drop the sentence: the fact that
+					// subagents are running is the part the operator has to act on.
+					return count > 0 ? t('refusedSubagents', { n: count }) : t('refusedSubagents', { n: '?' })
+				}
+				case 'unknown-session':
+					return t('refusedUnknown')
+				case 'bad-id':
+					return t('refusedBadId')
+				case 'unavailable':
+					return t('refusedUnavailable')
+				case 'cancelled':
+					return t('refusedCancelled')
+				default:
+					// A code this build has no copy for, or no code at all: the Host's own
+					// sentence is the only thing left, and it is better than nothing.
+					return reason
+			}
 		}
 
 		/* ------------------------------------------------------------------ */
@@ -744,17 +780,25 @@ window.__ModuleLoader__.load({
 		/* ------------------------------------------------------------------ */
 
 		/**
-		 * The "..." menu row. Renders nothing unless the row is archived, so a
-		 * normal conversation never grows a delete action, and closes its own menu
-		 * before raising the confirmation.
+		 * The "..." menu row.
+		 *
+		 * It renders on **every** conversation, archived or not. Deletion is not a
+		 * privilege of the archived view: the row you are looking at is exactly the
+		 * one you most often want gone, and routing that through "archive, then find
+		 * the archived page, then delete" made the destructive action harder to reach
+		 * than the harmless one — which is backwards.
+		 *
+		 * The safety this trades away was never really here: the Host refuses a
+		 * conversation whose turn is running or whose subagents are, reports the
+		 * refusal, and removes nothing. What the menu does keep is the shape of an
+		 * irreversible action — a separator, a danger tone, and an explicit
+		 * acknowledgment in the dialog it raises.
 		 * @param props - Owner share plus this plugin's injected behavior.
-		 * @returns The menu row, or null.
+		 * @returns The menu row.
 		 */
-		function DeleteSessionMenuItem({ sessionId, useArchived, useMenuOpenState, requestDelete, t, useLocale }: DeleteSessionMenuItemProps) {
+		function DeleteSessionMenuItem({ sessionId, useMenuOpenState, requestDelete, t, useLocale }: DeleteSessionMenuItemProps) {
 			const [, setMenuOpen] = useMenuOpenState()
 			useLocale()
-			const archived = useArchived((set) => set.has(sessionId))
-			if (!archived) return null
 			return jsx(primitives.MenuItemButton, {
 				separatorBefore: true,
 				icon: jsx(primitives.IconTrashOutlineRegular, { size: 14 }),
@@ -1406,7 +1450,6 @@ window.__ModuleLoader__.load({
 
 				registerCopy(locale)
 				const t = locale.bind(NS)
-				const archivedSet = derive(workspaces.list, (snapshot) => new Set(snapshot.archivedSessionIds))
 
 				/**
 				 * Re-render this half's components when the client's language changes.
@@ -1563,14 +1606,19 @@ window.__ModuleLoader__.load({
 			}
 
 			/**
-			 * Ask the Host to delete one archived conversation, then refresh the
-			 * browser's own projections so the row leaves every list immediately.
+			 * Ask the Host to delete one conversation, then refresh the browser's own
+			 * projections so the row leaves every list immediately.
+			 *
+			 * The conversation does not have to be archived: the menu row is on every
+			 * session, and the Host's own guard is what refuses a session with work in
+			 * flight. A refusal comes back as `ok: false` with a reason **code**, which
+			 * {@link refusalText} turns into a sentence in the client's language.
 			 *
 			 * The call is a plain `fetch` against the Host's own origin: it carries
 			 * the browser session cookie the page was admitted with, and answers the
 			 * same shape the Host wrote (`{ ok, value }` or `{ ok, error }`). The Host
 			 * never trusts this body, so nothing here is a security decision.
-			 * @param sessionId - The archived Session.
+			 * @param sessionId - The Session to delete.
 			 * @returns Resolution after the outcome is reported and the dialog closed.
 			 */
 			const confirmDelete = async (sessionId: string) => {
@@ -1603,7 +1651,7 @@ window.__ModuleLoader__.load({
 						)
 						return
 					}
-					notify('failed', outcome?.error?.message ?? '')
+					notify('failed', refusalText(t, outcome?.error?.details?.refusal, outcome?.error?.message ?? ''))
 				} finally {
 					// The dialog must never outlive its request, whatever happened.
 					requestStore.set(null)
@@ -1768,8 +1816,7 @@ window.__ModuleLoader__.load({
 			const menuInjected = (): MenuInjected => ({
 				requestDelete,
 				t,
-				useLocale,
-				useArchived: bindArchivedHook(archivedSet)
+				useLocale
 			})
 
 			// One registration per slot, each re-established when the declaring
