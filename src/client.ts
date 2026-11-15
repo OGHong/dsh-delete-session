@@ -13,13 +13,25 @@
  * a running conversation is refused by the Host (and reported as such), and the
  * settings page keeps its own archived-only controls.
  *
+ * The row has two carriers, because the menu does. Up to 0.2.1 a Session's
+ * "..." menu was a React slot (`sidebar.workspaces.session.menu.item`), and this
+ * half registered into it. 0.2.2 renders that slot *inside* the context menu —
+ * between the declarative actions and the popup's footer — so a React row can
+ * only ever appear before 归档会话, whatever order it asks for. The row is
+ * therefore registered as a declarative `contextMenus` action with
+ * `afterContent: true` and order 700, and the React row is kept as the fallback
+ * for a composition without that service; the fallback renders nothing while the
+ * action is live, so exactly one row is ever on screen.
+ *
  * Three rules this file follows, all of them learned the hard way in
  * `plugins/dsh-purge-archived/INCIDENT.md`:
  *
  *   1. It reaches every service through `ctx.get()` and exits quietly when one is
- *      missing. `inject` is not declared at all, because a declared service that
- *      is not there yet parks the entry as `pending` — and the renderer's boot
- *      treats *any* non-active client entry as fatal.
+ *      missing. No service is named in the entry's own `inject`, because a
+ *      declared service that is not there yet parks the entry as `pending` — and
+ *      the renderer's boot treats *any* non-active client entry as fatal. The one
+ *      *nested* injection (`contextMenus`, for the declarative menu row) waits on
+ *      a fiber below that callback, so it cannot park the entry either.
  *   2. It imports only modules the shell already seeds into the platform module
  *      table (`react`, `react/jsx-runtime`, and the UI primitives), so
  *      `dsh.client.external` stays empty and no second copy of anything is
@@ -133,6 +145,25 @@ window.__ModuleLoader__.load({
 		/** The Host route this half posts to; the Host half owns the same pair. */
 		const CHANNEL = '/_delete-session'
 		const ENDPOINT = 'delete'
+		/**
+		 * The row's identity, in both carriers it can have.
+		 *
+		 * One string, deliberately: it is the legacy slot entry's id *and* the
+		 * context-menu contribution's id (and the key its icon slot registers
+		 * under), so a profile that retargets the row by id retargets the whole
+		 * row rather than half of it.
+		 */
+		const MENU_ID = `${PACKAGE}.delete`
+		/**
+		 * Where the declarative action sorts, among the popup's footer actions.
+		 *
+		 * 0.2.2 renders a Session menu as `items → content rows → footer`, and the
+		 * shipped 归档会话 is an `afterContent` action at order 600. Only an action
+		 * above 600 that is itself `afterContent` lands after it — a content row
+		 * (the legacy React slot) renders *before* the footer whatever its order
+		 * says, which is exactly the regression this constant fixes.
+		 */
+		const MENU_ORDER = 700
 		/** The archived list the settings section reads. */
 		const ENDPOINT_LIST = 'archived'
 		/** The bulk deletion the settings section runs. */
@@ -249,6 +280,57 @@ window.__ModuleLoader__.load({
 			refresh?(): Promise<unknown>
 		}
 
+		/**
+		 * The Session a context-menu contribution was captured on.
+		 *
+		 * `ContextMenuTargetMap['session']` is `{ sessionId, displayTitle }`; only
+		 * the id is read here, and it is captured when the menu opens, so a
+		 * selection that moves afterwards cannot retarget a pending deletion.
+		 */
+		interface SessionMenuTarget {
+			readonly sessionId: string
+		}
+
+		/**
+		 * One declarative context-menu action, as 0.2.2 projects it.
+		 *
+		 * The registry keeps `run` and hands this half's presentation fields to the
+		 * popup: `label` is already localized, `icon` is a key (never an element —
+		 * the `contextMenu.icon` slot renders it), and `afterContent` is what moves
+		 * the row past the React content rows into the popup's footer.
+		 */
+		interface ContextMenuAction {
+			readonly id: string
+			readonly label: string
+			readonly icon?: { readonly key: string; readonly src?: string }
+			readonly disabled?: boolean
+			readonly danger?: boolean
+			readonly separatorBefore?: boolean
+			readonly afterContent?: boolean
+			readonly children?: readonly ContextMenuAction[]
+			run?(): void | Promise<void>
+		}
+
+		/**
+		 * The client's context-menu registry.
+		 *
+		 * Optional in every composition: 0.2.2 mounts it from
+		 * `dsh-client-ui-context-menu`, and a profile that leaves that package out
+		 * has no `contextMenus` service at all — which is why this half never names
+		 * it in `inject` and keeps the slot row as a fallback.
+		 */
+		interface ContextMenusService {
+			/** Register one contribution for a target kind; the returned disposer withdraws it. */
+			register(contribution: {
+				readonly id: string
+				readonly target: 'session'
+				readonly order: number
+				/** Stores whose change re-runs `resolve` for the same captured target. */
+				observe?(target: SessionMenuTarget): readonly Observable<unknown>[]
+				resolve(target: SessionMenuTarget, signal?: AbortSignal): readonly ContextMenuAction[] | Promise<readonly ContextMenuAction[]>
+			}): () => void
+		}
+
 		/** A selector hook: what a binding of `react.useSyncExternalStore` looks like to a component. */
 		type SelectorHook<Value> = <Selected>(selector: (value: Value) => Selected) => Selected
 
@@ -265,7 +347,10 @@ window.__ModuleLoader__.load({
 		/** One slot declaration, as the registry takes it. */
 		interface SlotDeclaration {
 			readonly name: string
-			readonly id: string
+			/** The entry's id, for a list slot; a keyed slot is addressed by `key` instead. */
+			readonly id?: string
+			/** The entry's key, for a keyed slot such as `contextMenu.icon`. */
+			readonly key?: string
 			readonly order?: number
 			/**
 			 * The nav row's text, for the one seat that projects one.
@@ -297,11 +382,28 @@ window.__ModuleLoader__.load({
 			workspaces: WorkspacesService
 			locale: LocaleService
 			sessions: SessionsService
+			contextMenus: ContextMenusService
 		}
 
 		/** The context `inject` hands the deferred callback. */
 		interface ScopedContext {
 			get<K extends keyof BrowserServices>(key: K): BrowserServices[K] | undefined
+			/**
+			 * Run one effect now and tear its result down with this injection.
+			 *
+			 * Every registration this half makes is owned by an effect, so an
+			 * unloaded (or re-injected) plugin withdraws its rows instead of leaving
+			 * dead entries behind — the same contract the shipped halves rely on.
+			 */
+			effect(execute: () => unknown, label?: string): unknown
+			/**
+			 * Run one callback once the named services are present too.
+			 *
+			 * A *nested* injection, not a declaration on the entry: this fiber lives
+			 * under the deferred callback, so waiting for an optional service here
+			 * cannot park the client entry itself.
+			 */
+			inject(names: readonly (keyof BrowserServices)[], callback: (scoped: ScopedContext) => void): unknown
 		}
 
 		/** The browser Cordis context this half is applied with. */
@@ -458,6 +560,15 @@ window.__ModuleLoader__.load({
 			readonly requestDelete: (sessionId: string) => void
 			readonly t: Translate
 			readonly useLocale: () => LocaleSnapshot
+			/**
+			 * Whether the declarative action has taken the row over.
+			 *
+			 * Read at render time, and it is what keeps "two carriers, one row" true
+			 * even when the context-menu service only arrives after this half was
+			 * injected: the slot row is always registered, and it stands down the
+			 * moment the action is live.
+			 */
+			readonly isContextMenuAction: () => boolean
 		}
 
 		/** The row's props: the owner's own share plus the inject face above. */
@@ -793,12 +904,19 @@ window.__ModuleLoader__.load({
 		 * refusal, and removes nothing. What the menu does keep is the shape of an
 		 * irreversible action — a separator, a danger tone, and an explicit
 		 * acknowledgment in the dialog it raises.
+		 *
+		 * This is the **fallback** carrier: 0.2.2 renders Session menus through the
+		 * context-menu registry, and `activateContextMenu` below registers the same
+		 * row there. The hooks still run on every render and the row then returns
+		 * `null`, because a component whose hook count changes between renders is
+		 * the one React rule even a stand-down must not break.
 		 * @param props - Owner share plus this plugin's injected behavior.
-		 * @returns The menu row.
+		 * @returns The menu row, or nothing while the declarative action owns it.
 		 */
-		function DeleteSessionMenuItem({ sessionId, useMenuOpenState, requestDelete, t, useLocale }: DeleteSessionMenuItemProps) {
+		function DeleteSessionMenuItem({ sessionId, useMenuOpenState, requestDelete, t, useLocale, isContextMenuAction }: DeleteSessionMenuItemProps) {
 			const [, setMenuOpen] = useMenuOpenState()
 			useLocale()
+			if (isContextMenuAction()) return null
 			return jsx(primitives.MenuItemButton, {
 				separatorBefore: true,
 				icon: jsx(primitives.IconTrashOutlineRegular, { size: 14 }),
@@ -809,6 +927,20 @@ window.__ModuleLoader__.load({
 				},
 				children: t('menu')
 			})
+		}
+
+		/**
+		 * The declarative row's glyph, for the keyed `contextMenu.icon` slot.
+		 *
+		 * The popup renders this component for every action whose `icon.key` matches,
+		 * and hands it the captured `icon` metadata — which carries nothing this row
+		 * needs, because it has exactly one glyph. Rendered without a size on
+		 * purpose: the shipped Session actions register their icons the same way, so
+		 * the popup's own metric decides it rather than this bundle.
+		 * @returns The trash mark, or nothing when the shell seeds no such icon.
+		 */
+		function DeleteSessionMenuIcon() {
+			return iconOf('IconTrashOutlineRegular')
 		}
 
 		/* ------------------------------------------------------------------ */
@@ -1426,7 +1558,7 @@ window.__ModuleLoader__.load({
 		/* ------------------------------------------------------------------ */
 
 		/**
-		 * Register the menu row and its two overlays.
+		 * Register the menu row, its two overlays, and the settings section.
 		 *
 		 * Registration is *deferred* through `ctx.inject`, and that is the whole
 		 * point of this shape. A client entry materializes early — before the
@@ -1813,10 +1945,18 @@ window.__ModuleLoader__.load({
 			// spreads owner props LAST, and this slot's owner supplies its own `t`
 			// from the ui-workspace namespace — so a `t` bound onto the component
 			// arrives as `undefined` here, and reading it throws during render.
+			//
+			// `isContextMenuAction` is the one live bit of state on this face: the
+			// declarative action is registered when *its* service appears, which can
+			// be later than this callback (the client starts every plugin at once and
+			// awaits them together), so the choice cannot be made once, here, at
+			// injection time without risking the old order forever.
+			let menuActionLive = false
 			const menuInjected = (): MenuInjected => ({
 				requestDelete,
 				t,
-				useLocale
+				useLocale,
+				isContextMenuAction: () => menuActionLive
 			})
 
 			// One registration per slot, each re-established when the declaring
@@ -1830,16 +1970,111 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			/**
+			 * Put the row in the 0.2.2 context menu as a declarative action.
+			 *
+			 * 0.2.2 renders a Session menu as `items → content rows → footer`:
+			 * every non-`afterContent` action first, then the React rows of
+			 * `contextMenu.content` (which is where the slot row above lives), then
+			 * the `afterContent` actions. The shipped 归档会话 is an `afterContent`
+			 * action at order 600, so a content row can never follow it — the old
+			 * row rendered *before* 归档会话, contradicting what README promised.
+			 * `afterContent: true` plus an order above 600 is what restores the
+			 * documented order, and it is the whole reason for this carrier.
+			 *
+			 * A registration failure is caught here rather than left to `effect`:
+			 * cordis composes effect errors into its log and swallows them, so a
+			 * rejected duplicate would otherwise leave the row with no carrier at
+			 * all. Swallowing it here instead leaves `menuActionLive` false and the
+			 * legacy row on screen.
+			 * @param menuScoped - The injection that owns `contextMenus`.
+			 * @param menus - The registry.
+			 * @returns Nothing; the registration lives and dies with the service.
+			 */
+			const activateContextMenu = (menuScoped: ScopedContext, menus: ContextMenusService) => {
+				let live = false
+				try {
+					menuScoped.effect(() => {
+						let withdraw: (() => void) | null = null
+						try {
+							withdraw = menus.register({
+								id: MENU_ID,
+								target: 'session',
+								order: MENU_ORDER,
+								// Every store `resolve` reads, plus the workspace list the
+								// shipped Session actions observe: a push there is the one
+								// signal that the captured Session may have come or gone, and
+								// re-resolving is cheaper than teaching the popup to doubt a
+								// target. `resolve` itself reads only the locale.
+								observe: () => [workspaces.list, locale],
+								resolve: ({ sessionId }) => [
+									{
+										id: 'delete',
+										label: t('menu'),
+										...(typeof primitives.IconTrashOutlineRegular === 'function' ? { icon: { key: MENU_ID } } : {}),
+										danger: true,
+										separatorBefore: true,
+										afterContent: true,
+										// The confirmation stays where it was: this raises the same
+										// `shell.overlay` request the slot row raises, so there is one
+										// dialog, one acknowledgment gate, and one Host call.
+										run: () => requestDelete(sessionId)
+									}
+								]
+							})
+						} catch (error) {
+							ctx.logger?.warn?.(`${PACKAGE}: the context menu refused the delete action: ${describe(error)}`)
+							return
+						}
+						live = true
+						menuActionLive = true
+						return () => {
+							menuActionLive = false
+							withdraw?.()
+						}
+					}, `${PACKAGE}: session delete action`)
+				} catch (error) {
+					ctx.logger?.warn?.(`${PACKAGE}: could not arm the context-menu action: ${describe(error)}`)
+					return
+				}
+				// The keyed icon is registered only when the action it belongs to is:
+				// a `contextMenu.icon` entry for a key no action names is dead weight,
+				// and registering it under the same constant is what makes the pair
+				// impossible to drift.
+				if (live) register('contextMenu.icon', { name: 'contextMenu.icon', key: MENU_ID }, DeleteSessionMenuIcon)
+			}
+
+			// The fallback carrier, registered unconditionally: a composition that
+			// predates the context-menu registry (or leaves it out) has no
+			// `contextMenus` service, and the slot is then the only thing that can
+			// show the row at all. It renders nothing once the declarative action is
+			// live, so registering both can never produce two rows — see
+			// `DeleteSessionMenuItem`.
 			register(
 				'sidebar.workspaces.session.menu.item',
 				{
 					name: 'sidebar.workspaces.session.menu.item',
-					id: `${PACKAGE}.delete`,
+					id: MENU_ID,
 					order: 500,
 					inject: menuInjected
 				},
 				DeleteSessionMenuItem
 			)
+
+			// The declarative carrier. `contextMenus` is deliberately *not* one of the
+			// services this half injects on: a declared service that never arrives
+			// parks a client entry, and the renderer treats any non-active entry as
+			// fatal. A nested injection waits for it without that cost, fires
+			// immediately when it is already there, and is disposed with the callback
+			// if the owning plugin ever goes away.
+			try {
+				scoped.inject(['contextMenus'], (menuScoped) => {
+					const menus = menuScoped.get('contextMenus')
+					if (menus) activateContextMenu(menuScoped, menus)
+				})
+			} catch (error) {
+				ctx.logger?.warn?.(`${PACKAGE}: could not wait for the context-menu service: ${describe(error)}`)
+			}
 
 			register(
 				'shell.overlay',

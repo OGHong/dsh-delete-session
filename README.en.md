@@ -8,8 +8,9 @@ transcript, cached projections, workspace accounting and rewind snapshots includ
 ## What it adds
 
 - **A "Delete conversation" row in every session's `...` menu** — archived or not, no archive step
-  required first. It sits after the shipped "Archive"/"Unarchive" row, and asks for an explicit
-  acknowledgement before anything is removed;
+  required first. It sits after the shipped "Archive"/"Unarchive" row (on 0.2.2 that takes a
+  declarative context-menu action — see below), and asks for an explicit acknowledgement before
+  anything is removed;
 - **Settings → Archived conversations**: a page listing every archived session with a search field,
   whose right end holds the irreversible action (outlined, in the theme's error colour — never a
   plain button).
@@ -17,6 +18,25 @@ transcript, cached projections, workspace accounting and rewind snapshots includ
 Deletion is no longer hidden behind archiving: archiving is "do not show it to me", deletion is
 "it is gone", and they are different decisions. The menu offers deletion directly because the row
 you are actually looking at is the one you most often want gone.
+
+## Where that row sits since 0.2.2
+
+0.2.2 moved Session menus onto the context-menu system, and the popup has a fixed three-part order:
+
+```
+declarative actions (items) → component rows (contextMenu.content) → footer actions (afterContent)
+```
+
+The shipped 归档会话 / Archive action is a footer action at order 600, and the "register a React row"
+mechanism this package used on 0.2.1 belongs to the middle part — a component row renders before
+every footer action no matter what order it asks for. On 0.2.2 the row therefore appeared *before*
+Archive, the opposite of what this document promises.
+
+It is now registered as a declarative action: `afterContent: true` with `order: 700`, which lands it
+after Archive. A composition without the `contextMenus` service (an older DSH, or a profile that
+drops the context-menu package) still gets the original component row — the plugin waits for that
+service, uses the declarative action when it arrives, and renders the component row empty — so
+either composition shows exactly one row.
 
 Confirming removes all of these traces, and reports any residue by name instead of calling it
 "some files":
@@ -39,8 +59,8 @@ so a second conversation in the same workspace is never disturbed.
 |---|---|
 | OS | macOS / Linux / Windows (pure Node, no platform APIs) |
 | Node | 22.6+ (what `engines` declares) |
-| DeepSeek Harness | **0.2.0-rc.2 or newer (0.2.x)** — declared in `peerDependencies`; DSH refuses to load it on an incompatible version |
-| Dependencies | none at runtime; one peer, `@deepseek-ai/cordis` |
+| DeepSeek Harness | **0.2.2-rc.3 or newer (0.2.x)** — declared in `engines.dsh` and `peerDependencies`; DSH refuses to load it on an incompatible version |
+| Dependencies | none at runtime; the peers are `@deepseek-ai/cordis ~4.1` (DSH ships cordis 4.1.0 since 0.2.2) and DSH's own client packages — all platform-provided, never bundled |
 
 ## Install
 
@@ -89,7 +109,7 @@ Why the order is what it is, the fourteen silent failures it closes, the layout 
 checks all live in **[docs/DESIGN.md](docs/DESIGN.md)** (Chinese).
 
 ```bash
-npm run verify     # typecheck + build + 323 self-test assertions
+npm run verify     # typecheck + build + 355 self-test assertions
 ```
 
 ## License

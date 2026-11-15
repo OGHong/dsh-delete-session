@@ -1049,7 +1049,7 @@ section('the browser half is a loadable, self-contained bundle')
 		get: () => undefined,
 		inject: (names, callback) => {
 			inertCallbacks.push(names)
-			callback({ get: () => undefined })
+			callback({ get: () => undefined, inject: (inner, run) => { inertCallbacks.push(inner); run({ get: () => undefined }) }, effect: () => () => {} })
 			return () => {}
 		}
 	}
@@ -1072,7 +1072,11 @@ section('the browser half is a loadable, self-contained bundle')
 			// The whole declaration is kept, not just the identity: a later check
 			// drives each registration's own inject face, which is where the section
 			// gets its list and its actions from.
-			registered.push({ ...options, key: options.name, component })
+			//
+			// `key` is the slot name here, because that is what every check below
+			// addresses; a keyed slot's own entry key — `contextMenu.icon` needs one —
+			// is kept as `declarationKey`, since the spread would otherwise lose it.
+			registered.push({ ...options, key: options.name, declarationKey: options.key, component })
 			return () => {}
 		}
 	}
@@ -1130,10 +1134,41 @@ section('the browser half is a loadable, self-contained bundle')
 		},
 		locale: fakeLocale
 	}
+	/**
+	 * One scoped context, as `ctx.inject` hands it to a plugin callback.
+	 *
+	 * The real face carries `get`, `effect`, and a nested `inject` of its own. A
+	 * fake with only `get` would leave the 0.2.2 context-menu path unreachable —
+	 * this half waits for that service through a nested injection — so all three
+	 * are modelled together, and every nested declaration and effect is recorded.
+	 * @param get - Service lookup for this composition.
+	 * @param nested - Receives the name list of every nested injection.
+	 * @param effects - Receives one `{ label, dispose }` per effect the plugin runs.
+	 * @returns The scoped context.
+	 */
+	const scopeOf = (get, nested = [], effects = []) => {
+		const scoped = {
+			get,
+			effect: (execute, label) => {
+				const cleanup = execute()
+				const dispose = () => {
+					if (typeof cleanup === 'function') cleanup()
+				}
+				effects.push({ label, dispose })
+				return dispose
+			},
+			inject: (names, callback) => {
+				nested.push(names)
+				callback(scoped)
+				return () => {}
+			}
+		}
+		return scoped
+	}
 	const full = {
 		get: (name) => services[name],
 		inject: (names, callback) => {
-			callback({ get: (name) => services[name] })
+			callback(scopeOf((name) => services[name]))
 			return () => {}
 		}
 	}
@@ -1508,7 +1543,7 @@ section('the browser half is a loadable, self-contained bundle')
 	const bareContext = {
 		get: (name) => bareServices[name],
 		inject: (names, callback) => {
-			callback({ get: (name) => bareServices[name] })
+			callback(scopeOf((name) => bareServices[name]))
 			return () => {}
 		}
 	}
@@ -1543,6 +1578,169 @@ section('the browser half is a loadable, self-contained bundle')
 			emptyPage.includes('emptyHint') &&
 			emptyPage.includes('"width":"56px"')
 	)
+
+	/* ---- the 0.2.2 context menu: the row as a declarative action -------- */
+
+	// 0.2.2 renders a Session menu as `items → content rows → footer`, and the
+	// React slot this half used to register into is one of those content rows. A
+	// content row therefore renders *before* the footer's 归档会话 (order 600)
+	// whatever order the slot asks for — which is the regression this block pins.
+	// The documented order can only come from a declarative action that is itself
+	// `afterContent` and sorts above 600.
+	//
+	// Nothing above ran against a composition that provides `contextMenus`, so no
+	// keyed icon can exist yet: that is the "fallback chosen when it does not
+	// exist" half of the pair, and the slot row's render checks above are the
+	// positive half.
+	equal(
+		'a composition without the context-menu service registers no keyed icon',
+		registered.filter((entry) => entry.key === 'contextMenu.icon').length,
+		0
+	)
+
+	const contributions = []
+	const contextMenus = {
+		register(contribution) {
+			contributions.push(contribution)
+			// The registry hands back a disposer, and the plugin is expected to own
+			// it: withdrawing is what "registered through an effect" has to mean.
+			return () => {
+				const index = contributions.indexOf(contribution)
+				if (index >= 0) contributions.splice(index, 1)
+			}
+		}
+	}
+	registered.length = 0
+	const menuNested = []
+	const menuEffects = []
+	const menuServices = { ...services, contextMenus }
+	const menuContext = {
+		get: (name) => menuServices[name],
+		inject: (names, callback) => {
+			callback(scopeOf((name) => menuServices[name], menuNested, menuEffects))
+			return () => {}
+		}
+	}
+	try {
+		exports.apply(menuContext)
+	} catch (error) {
+		check('apply() takes the declarative path on a 0.2.2 composition', false, message(error))
+	}
+
+	equal('it waits for the context-menu service through a nested injection', menuNested, [['contextMenus']])
+	equal('the registry receives exactly one contribution', contributions.length, 1)
+	const contribution = contributions[0]
+	equal(
+		'it is the Session-targeted delete action, above the shipped archive action (600)',
+		[contribution?.id, contribution?.target, contribution?.order],
+		['dsh-delete-session.delete', 'session', 700]
+	)
+
+	// `observe` has to name every store `resolve` reads, or a language switch (and
+	// any workspace push) would leave the menu showing stale copy until reopened.
+	const capturedTarget = { sessionId: SESSION, displayTitle: 'a conversation' }
+	const observed = contribution?.observe?.(capturedTarget) ?? []
+	check(
+		'observe declares the workspace list and the locale, and nothing else',
+		observed.length === 2 && observed[0] === workspaces.list && observed[1] === fakeLocale
+	)
+
+	const actions = contribution?.resolve?.(capturedTarget, new AbortController().signal) ?? []
+	equal('it resolves exactly one action', actions.length, 1)
+	const action = actions[0]
+	equal(
+		'the action is the delete row, labelled from this package locale namespace',
+		[action?.id, action?.label],
+		['delete', 'dsh-delete-session.menu']
+	)
+	check('it is a danger row', action?.danger === true)
+	check('it draws a separator before itself', action?.separatorBefore === true)
+	// This is the whole point: only a footer action renders after the content rows.
+	check('it is a footer action, which is what puts it after the content rows', action?.afterContent === true)
+	equal('its icon is a key, never an element', action?.icon, { key: 'dsh-delete-session.delete' })
+	const iconEntry = registered.find((entry) => entry.name === 'contextMenu.icon')
+	equal(
+		'the keyed icon component registers under exactly that key',
+		[iconEntry?.declarationKey, typeof iconEntry?.component, typeof iconEntry?.component?.()],
+		['dsh-delete-session.delete', 'function', 'object']
+	)
+
+	// Running it must raise the same confirmation the slot row raises: one dialog,
+	// one acknowledgment gate, one Host call — not a second deletion implementation.
+	const menuConfirm = registered.find((entry) => entry.id === 'dsh-delete-session.confirm').inject()
+	action?.run?.()
+	equal(
+		'running the action raises the confirmation for the captured conversation',
+		menuConfirm.usePending((value) => value),
+		{ kind: 'one', sessionId: SESSION }
+	)
+	menuConfirm.settleDelete()
+
+	// One row, in this composition too. The slot entry stays registered — it is the
+	// fallback for the next composition — but it renders nothing while the action
+	// owns the row, so the menu never shows two delete rows.
+	const fallbackRow = registered.find((entry) => entry.key === 'sidebar.workspaces.session.menu.item')
+	check('the slot row is still registered, as the fallback', fallbackRow !== undefined)
+	const fallbackInjected = fallbackRow.inject()
+	const renderFallback = () => fallbackRow.component({ sessionId: SESSION, useMenuOpenState: () => [true, () => {}], ...fallbackInjected })
+	check('but it renders nothing while the declarative action owns the row', renderFallback() === null)
+	check('and it leaves the confirmation seat untouched', menuConfirm.usePending((value) => value) === null)
+
+	// An unloaded plugin must hand the row back rather than leave it to a stale
+	// flag: the registration is owned by an effect, and disposing it is what the
+	// loader does on disable or HMR.
+	for (const effect of menuEffects) effect.dispose?.()
+	equal('withdrawing the action empties the registry', contributions.length, 0)
+	check('and the slot row carries the feature again', renderFallback()?.props?.children === 'dsh-delete-session.menu')
+
+	// And the service can arrive *after* this half was injected: the client starts
+	// every plugin at once (`ClientEntries.start` → `Promise.all(plugins)`), so the
+	// order between this half and the context-menu package is not ours to choose.
+	// A decision made once at injection time would keep the pre-0.2.2 order for the
+	// life of the page, silently — which is why the wait is a nested injection and
+	// the stand-down is read at render time.
+	registered.length = 0
+	const lateContributions = []
+	const pendingNested = []
+	const lateServices = { ...services }
+	/** One scoped context whose nested injection is *queued*, as cordis does while the service is missing. */
+	const lateScoped = () => ({
+		get: (name) => lateServices[name],
+		effect: (execute) => {
+			const cleanup = execute()
+			return () => {
+				if (typeof cleanup === 'function') cleanup()
+			}
+		},
+		inject: (names, callback) => {
+			pendingNested.push(callback)
+			return () => {}
+		}
+	})
+	exports.apply({
+		get: (name) => lateServices[name],
+		inject: (names, callback) => {
+			callback(lateScoped())
+			return () => {}
+		}
+	})
+	const lateRow = registered.find((entry) => entry.key === 'sidebar.workspaces.session.menu.item')
+	const renderLate = () => lateRow.component({ sessionId: SESSION, useMenuOpenState: () => [true, () => {}], ...lateRow.inject() })
+	check('with the service still missing, the slot row is the row', renderLate()?.props?.children === 'dsh-delete-session.menu')
+	equal('and the nested injection is left waiting, not decided', pendingNested.length, 1)
+
+	lateServices.contextMenus = {
+		register(contribution) {
+			lateContributions.push(contribution)
+			return () => {
+				const index = lateContributions.indexOf(contribution)
+				if (index >= 0) lateContributions.splice(index, 1)
+			}
+		}
+	}
+	for (const callback of pendingNested.splice(0)) callback(lateScoped())
+	equal('when it arrives, the action registers', lateContributions.length, 1)
+	check('and the slot row stands down inside the same lifetime', renderLate() === null)
 
 }
 

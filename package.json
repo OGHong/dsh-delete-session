@@ -1,6 +1,6 @@
 {
   "name": "dsh-delete-session",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Delete an archived DeepSeek Harness conversation from its sidebar menu, including its transcript on disk and cached projections",
   "license": "MIT",
   "author": "OGHong",
@@ -53,7 +53,7 @@
   ],
   "engines": {
     "node": ">=22.6",
-    "dsh": ">=0.2.0-rc.2"
+    "dsh": ">=0.2.2-rc.3"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -62,12 +62,12 @@
     "verify": "npm run typecheck && npm run build && npm test"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.4",
-    "@deepseek-ai/dsh-api-workspace-controller": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-locale": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-primitives": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-workspace": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-home-paths": "^0.2.0-rc.2"
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-api-workspace-controller": "^0.2.2",
+    "@deepseek-ai/dsh-client-locale": "^0.2.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.2.2",
+    "@deepseek-ai/dsh-client-ui-workspace": "^0.2.2",
+    "@deepseek-ai/dsh-home-paths": "^0.2.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",

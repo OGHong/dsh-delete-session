@@ -314,7 +314,69 @@ The browser half follows the same rule from the other side: it declares **no
 that stays `pending` on a service fails the entire page boot, and it imports only
 modules the shell already seeds into the platform module table
 (`react`, `react/jsx-runtime`, and the UI primitives), so it bundles no second
-copy of anything.
+copy of anything. The one service it must *wait* for — `contextMenus`, which
+0.2.2's declarative menu rows need — is waited for through a **nested**
+`ctx.inject` inside the deferred callback. A nested injection opens a fiber below
+that callback, so an absent service leaves an inert fiber instead of a parked
+client entry: the row degrades to the React slot, and the page still boots.
+
+### The Session menu in 0.2.2: items → content rows → footer
+
+0.2.2 moved Session menus onto the context-menu registry, and the popup has a
+fixed three-part order. The provider's overlay (`MenuOverlay`, in
+`dsh-client-ui-context-menu/lib/client.js`) hands the `Menu` primitive three
+things, in this order:
+
+```
+items    menuEntries(actions.filter(a => !a.afterContent))     // declarative actions
+children renderSlot('contextMenu.content', …)                  // React rows (the old slot)
+footer   menuEntries(actions.filter(a =>  a.afterContent))     // e.g. 归档会话, order 600
+```
+
+The Menu primitive puts the footer in its own element *after* the viewport that
+holds `items` + `children` (`dsh-web-frontend` → `Menu`: `viewport` then
+`We.footer`). So a React row contributed through
+`sidebar.workspaces.session.menu.item` is a **content row**: it renders before
+every `afterContent` action no matter what `order` it asks for. On 0.2.2 this row
+therefore appeared *before* 归档会话 — the opposite of what this package
+documents — even though its slot order (500) had not changed.
+
+The row is now registered the way the shipped Session actions are:
+
+- `ctx.contextMenus.register({ id: 'dsh-delete-session.delete', target: 'session',
+  order: 700, observe, resolve })`, inside the existing deferred `ctx.inject`,
+  owned by `ctx.effect` so unloading withdraws it;
+- `observe` returns `[workspaces.list, locale]` — every store `resolve` reads
+  (the label resolves through the locale at call time, so a language switch
+  re-resolves the action), plus the workspace list the shipped actions observe;
+- the action is `{ id: 'delete', label: t('menu'), icon: { key: MENU_ID },
+  danger: true, separatorBefore: true, afterContent: true, run: () =>
+  requestDelete(sessionId) }`. `afterContent` is what puts it in the footer at
+  all; order 700 is what puts it after 归档会话 (600). `run` raises the *same*
+  `shell.overlay` confirmation the slot row raises — one dialog, one
+  acknowledgment gate, one Host call;
+- the icon is keyed, because 0.2.2 actions carry `{ key, src? }` instead of a
+  React node: `slots.register({ name: 'contextMenu.icon', key: MENU_ID }, …)`
+  renders the trash mark for exactly that key.
+
+**Exactly one row, in every composition.** Both carriers exist in the file, and
+they cannot both render:
+
+| composition | declarative action | slot row | rows on screen |
+|---|---|---|---|
+| 0.2.2 with the context-menu package | registered | registered, renders `null` | 1 |
+| a composition without `contextMenus` | never registered | registered, renders the row | 1 |
+| `register` throws (duplicate id, disposed registry) | not registered | registered, renders the row | 1 |
+| plugin disabled / HMR replace | withdrawn with its effect | renders the row again | 1 |
+
+The slot row is registered unconditionally and carries a live
+`isContextMenuAction()` on its inject face; it returns `null` while the action is
+live. That is deliberate rather than "register the fallback only when the service
+is missing": the client starts every plugin at once and awaits them together
+(`ClientEntries.start` → `Promise.all(plugins)`), so `contextMenus` can appear
+*after* this half's own injection. A one-shot decision made there would have
+silently kept the old order forever, which is the bug this release fixes. Hooks
+still run before the `null` return, so the component's hook count never changes.
 
 ### Fourteen ways this fails silently
 
@@ -462,16 +524,41 @@ perfectly healthy.
     because that path re-reads the list — which is exactly why deleting through
     the HTTP route, as a script or another tool would, looked like a failure.
 
+## 0.2.2 upgrade-guide audit
+
+0.4.0 is the compatibility release for DSH **0.2.2-rc.3** (cordis 4.1.0). Every
+guide shipped under `@deepseek-ai/dsh/docs/upgrade-guide/` for `v0.2.2-alpha.2`,
+`v0.2.2-alpha.3` and `v0.2.2-rc.1` was read against this package. The five named
+in the release request, plus the two that turned out to touch the same surfaces:
+
+| guide | verdict | evidence |
+|---|---|---|
+| `v0.2.2-alpha.2/context-menu-target` | **applies** (as the direction), renames **n/a** | The bundle touches none of the renamed names — no `MenuTarget`, `menuTarget` or `useMenuTarget` anywhere in `src/` (it renders its own React row and imports no context-menu package). The guide's third step — actions carry `{ key }` and icons render through a keyed `contextMenu.icon` slot — *is* what 0.4.0 adopted: `src/client.ts` → `icon: { key: MENU_ID }` + `slots.register({ name: 'contextMenu.icon', key: MENU_ID }, …)`. |
+| `v0.2.2-rc.1/archive-worktrees` | **does not apply** | The package has no worktree code (no `worktree` reference in `src/`), and the Forge bundle that owns the `worktree` service is not installed here. Archiving now removes a *clean* checkout; deleting goes further and removes the conversation, so anything the worktree service kept for it (a dirty checkout, a locked one, one with a committed embedded repo) stays on disk exactly as the guide describes. **Decision: deletion does not remove worktrees or branches.** It is not this plugin's resource — `git worktree remove` failing half-way would leave a checkout whose owning conversation no longer exists, and the deletion's own contract is "report what survived, never guess at other packages' state". The deletion's closing audit reports the traces it *does* own; a surviving checkout is deliberately not called residue. |
+| `v0.2.2-rc.1/session-append-overloads` | **does not apply** | No replacement of `Session.append` in `src/` or `selftest.mjs` (no `append(` at all). The Host half reads `session.list`/`sessions.get` state and removes files; it never appends events. |
+| `v0.2.2-rc.1/plugin-update-method` | **does not apply** | No read of `listBundles()`, `BundleInfo.updatable`, `pluginManager` or `ManagementError` in `src/`. The plugin is installed as a `link:` dependency and never updates itself. |
+| `v0.2.2-rc.1/window-drag-regions` | **does not apply** — verified, not assumed | The confirmation is the shared `RiskConfirmation` primitive (`src/client.ts` → `primitives.RiskConfirmation`), whose `Modal` renders through `createPortal(…, document.body)` (`dsh-web-frontend/dist/assets/index-Ciz7DZxv.js`, the `RiskConfirmation`/`Modal` pair). The macOS rule that still applies to it is `html[data-platform=darwin] body>:not(#root){-webkit-app-region:no-drag}` (`index-CSAdOBx6.css`): the page mounts in `<div id="root">` (`index.html`), so a body-level portal is excluded wholesale — the confirmation needs no `data-window-drag-exclude` of its own, and it covers no `data-window-drag` row (it is a centred body portal, not a header overlay). |
+| `v0.2.2-alpha.2/session-header-menu` | **does not apply** | That guide asks custom Web compositions to provide a context-menu provider for `dsh-session-log-export`'s header actions. This package registers no header action and no `contextMenus` provider — it now *consumes* one when present and degrades to the slot when absent. |
+| `v0.2.2-alpha.2/css-anchored-menus` | **does not apply** | No `useAnchoredPosition`, `AnchoredPositionOptions`, `getAnchorRect`, or direct `Menu` usage in `src/`; the popup belongs to `dsh-client-ui-context-menu`, which migrated on its own. |
+
+Two adjacent guides were checked and need no action either, because the plugin
+touches their subject only through stable surfaces:
+`v0.2.2-alpha.2/projection-*` (the deletion drops
+`storages/session_projcache/sessions/<id>.json`, and that domain and its
+per-record layout are unchanged in 0.2.2 — `dsh-session-projection-cache` →
+`src/spec.ts`, `name: 'session_projcache'`), and
+`v0.2.2-rc.1/runtime-context-reminders` (no model-visible surface at all).
+
 ## Layout
 
 | file | role |
 |---|---|
 | [`src/core.ts`](src/core.ts) | The deletion itself: tracing, guards, per-step report. Transport-free. |
 | [`src/index.ts`](src/index.ts) | Host half: the `deleteSession` service and the authenticated route. |
-| [`src/client.ts`](src/client.ts) | Browser half: the menu row, the confirmation, and the outcome notice. |
+| [`src/client.ts`](src/client.ts) | Browser half: the menu row (declarative action + slot fallback), the confirmation, and the outcome notice. |
 | [`src/types.d.ts`](src/types.d.ts) | The host boundary as local structural types. Type-only: emits nothing. |
 | `lib/*.js` | Build output of `npm run build`, and what the profile actually loads. |
-| [`selftest.mjs`](selftest.mjs) | 323 checks over the deletion, the archived list and batch, the routes, and the browser half — rendered and driven, not just parsed. |
+| [`selftest.mjs`](selftest.mjs) | 355 checks over the deletion, the archived list and batch, the routes, and the browser half — rendered and driven, not just parsed. |
 
 ## Development
 
@@ -504,7 +591,7 @@ Two rules this package follows, both from the DSH plugin contract:
 npm run verify
 ```
 
-Besides the 323 checks, two levels beyond the unit suite:
+Besides the 355 checks, two levels beyond the unit suite:
 
 - **Host, over HTTP.** A seeded archived conversation lost its log directory, its
   archive-set id and its accounting slot while a sibling conversation was
